@@ -15,6 +15,12 @@ crate-type = ["lib", "cdylib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# Tauri validates bundle resources from our build script. Making sherpa-rs-sys
+# a build dependency guarantees its own build script has downloaded/staged the
+# runtime DLLs into target/<profile>/ before src-tauri/build.rs tries to copy
+# them into the stable runtime/ directory. The normal dependency below still
+# owns the actual FFI used by the application.
+sherpa-rs-sys = { version = "0.6.8", default-features = false, features = ["download-binaries"] }
 
 [dependencies]
 prompt-core.workspace = true
