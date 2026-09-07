@@ -30,44 +30,22 @@ use tauri::{AppHandle, Manager};
 use crate::session::SessionState;
 use crate::speech::Recognizer;
 
-/// Capacity of the callback → worker queue, in chunks.
-///
-/// Bounded on purpose. If the worker ever falls behind real time, dropping
-/// audio is the correct failure: the presenter keeps speaking either way, and
-/// an unbounded queue would just grow until the transcript is arbitrarily far
-/// behind what is being said.
 const QUEUE_CHUNKS: usize = 64;
-
-/// How often the UI is told about the microphone level.
-///
-/// Fast enough that a waveform looks live, slow enough that reporting is not
-/// competing with speech decoding for the same thread.
 const BROADCAST_INTERVAL: Duration = Duration::from_millis(50);
 
-/// What the capture path is actually doing.
-///
-/// Recognition failing because audio was dropped and recognition failing
-/// because the model is weak look identical from the outside — words go missing
-/// at random either way. These numbers are what tells them apart.
 #[derive(Default)]
 pub struct Diagnostics {
-    /// Chunks the worker could not keep up with.
     dropped: AtomicUsize,
-    /// Times the network actually ran.
     decodes: AtomicUsize,
-    /// The most recent transcript, verbatim.
     heard: Mutex<String>,
-    /// Capture rate and channel count, as opened.
     format: Mutex<String>,
 }
 
-/// Diagnostics as the UI reads them.
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DiagnosticsView {
     pub dropped_chunks: usize,
     pub decodes: usize,
-    /// What the recogniser last transcribed, before any matching.
     pub heard: String,
     pub input_format: String,
 }
@@ -83,7 +61,6 @@ impl Diagnostics {
     }
 }
 
-/// A running capture session. Dropping it stops the microphone.
 pub struct AudioEngine {
     stop: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
@@ -93,8 +70,6 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
-    /// Opens the default input device and starts metering, optionally
-    /// transcribing through `recognizer`.
     pub fn start(app: AppHandle, recognizer: Option<Recognizer>) -> Result<Self, String> {
         let host = cpal::default_host();
         let device = host
@@ -117,9 +92,6 @@ impl AudioEngine {
             config.sample_format()
         );
 
-        // Best-effort: a device dropping out mid-session is worth a trace in
-        // the crash log, but failing to resolve that log's own path is not a
-        // reason to refuse to open the microphone at all.
         let log_path = crate::data_root(&app)
             .ok()
             .map(|root| root.join("textream.log"));
@@ -169,9 +141,6 @@ impl AudioEngine {
                     if stream.play().is_err() {
                         return;
                     }
-                    // The stream stays alive exactly as long as this thread
-                    // does; `cpal::Stream` is `!Send`, so it cannot be handed
-                    // back to the caller to hold.
                     while !stop.load(Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_millis(50));
                     }
@@ -189,11 +158,6 @@ impl AudioEngine {
         })
     }
 
-    /// Stops metering and transcribing without closing the device.
-    ///
-    /// The stream stays open so unmuting is instant — reopening a WASAPI
-    /// capture device mid-take costs hundreds of milliseconds and can fail if
-    /// something else grabbed it in the meantime.
     pub fn set_muted(&self, muted: bool) {
         self.muted.store(muted, Ordering::Relaxed);
     }
@@ -206,8 +170,6 @@ impl AudioEngine {
 impl Drop for AudioEngine {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // Capture first: it owns the sender, and the worker only exits once
-        // that sender is dropped and the channel closes.
         if let Some(handle) = self.capture.take() {
             let _ = handle.join();
         }
@@ -217,7 +179,6 @@ impl Drop for AudioEngine {
     }
 }
 
-/// Builds an input stream for whichever sample format the device offers.
 fn build_stream(
     device: &cpal::Device,
     config: cpal::StreamConfig,
@@ -227,9 +188,6 @@ fn build_stream(
     diagnostics: Arc<Diagnostics>,
     log_path: Option<PathBuf>,
 ) -> Result<cpal::Stream, String> {
-    // A stream error is a device dropping out mid-session — driver crash,
-    // unplugged cable — the kind of thing a presenter needs to have a trace
-    // of afterwards, not just a Follow mode that quietly stopped moving.
     let on_error = move |error| {
         if let Some(path) = &log_path {
             crate::diagnostics::append(path, &format!("microphone stream error: {error}"));
@@ -284,7 +242,6 @@ fn build_stream(
     })
 }
 
-/// Downmixes to mono and hands the chunk to the worker.
 fn forward(
     samples: impl Iterator<Item = f32>,
     channels: usize,
@@ -303,18 +260,11 @@ fn forward(
     if mono.is_empty() {
         return;
     }
-    // Never block the audio thread. A full queue means the worker is behind,
-    // and stalling here would underrun the device rather than help.
-    //
-    // Dropped audio is counted rather than ignored: it is heard as the
-    // recogniser missing words at random, which is impossible to tell apart
-    // from a weak model unless the number is visible somewhere.
     if let Err(TrySendError::Full(_)) = sender.try_send(mono) {
         diagnostics.dropped.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-/// Meters every chunk and, when a recogniser is present, transcribes it.
 #[allow(clippy::too_many_arguments)]
 fn run_worker(
     app: AppHandle,
@@ -335,9 +285,6 @@ fn run_worker(
         }
 
         let is_muted = muted.load(Ordering::Relaxed);
-        // Reporting silence rather than skipping the update keeps the speech
-        // gate closing on its own timer and the waveform reading zero, so a
-        // muted microphone looks muted instead of frozen.
         let level = if is_muted {
             0.0
         } else {
@@ -351,10 +298,6 @@ fn run_worker(
             session.feed_audio_level(level, timestamp)
         };
 
-        // The gate is fed from every chunk, but the UI is not told about every
-        // chunk. Audio arrives about a hundred times a second and each report
-        // is a JSON payload across the IPC boundary — enough traffic to starve
-        // the thread that has to decode speech in real time.
         if last_broadcast.elapsed() >= BROADCAST_INTERVAL {
             last_broadcast = Instant::now();
             crate::broadcast(&app, progress);
@@ -369,9 +312,6 @@ fn run_worker(
         };
 
         recognizer.accept(sample_rate, &chunk);
-        // Only read the transcript when the network actually ran. Fetching it
-        // on every chunk copies the whole string a hundred times a second for
-        // a value that changes perhaps three times a second.
         if !recognizer.decode() {
             continue;
         }
@@ -390,13 +330,70 @@ fn run_worker(
         }
 
         if update.endpoint {
-            // Rebase rather than restart: the position is kept, and the next
-            // transcript window is measured from here instead of from a stale
-            // origin that would drag the highlight backwards.
             recognizer.reset();
             last_transcript.clear();
             let state = app.state::<SessionState>();
             state.0.lock().unwrap().rebase_transcript_window();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn captured_chunk(samples: &[f32], channels: usize) -> (Vec<f32>, usize) {
+        let (sender, receiver) = sync_channel(1);
+        let diagnostics = Diagnostics::default();
+        forward(samples.iter().copied(), channels, &sender, &diagnostics);
+        (
+            receiver.try_recv().expect("forwarded audio chunk"),
+            diagnostics.dropped.load(Ordering::Relaxed),
+        )
+    }
+
+    #[test]
+    fn stereo_high_rate_frames_are_downmixed_without_changing_frame_count() {
+        // One millisecond of 192 kHz stereo input. The rate itself is carried
+        // separately into the recogniser; this verifies the callback path does
+        // not reinterpret, resample, or discard high-rate frames while
+        // downmixing them to mono.
+        let frames = 192usize;
+        let mut stereo = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let left = i as f32 / frames as f32;
+            let right = -left;
+            stereo.push(left);
+            stereo.push(right);
+        }
+
+        let (mono, dropped) = captured_chunk(&stereo, 2);
+        assert_eq!(mono.len(), frames);
+        assert!(mono.iter().all(|sample| sample.abs() < 1e-6));
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn multichannel_input_is_averaged_per_frame() {
+        let input = [1.0, 0.5, -0.5, 0.0, -1.0, 0.5, 0.5, 0.0];
+        let (mono, dropped) = captured_chunk(&input, 4);
+        assert_eq!(mono, vec![0.25, 0.0]);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn a_full_audio_queue_drops_instead_of_blocking_the_callback() {
+        let (sender, _receiver) = sync_channel(1);
+        let diagnostics = Diagnostics::default();
+
+        forward([0.1, 0.2].into_iter(), 1, &sender, &diagnostics);
+        forward([0.3, 0.4].into_iter(), 1, &sender, &diagnostics);
+
+        assert_eq!(diagnostics.dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn waveform_broadcast_interval_stays_at_twenty_hz() {
+        assert_eq!(BROADCAST_INTERVAL, Duration::from_millis(50));
     }
 }
