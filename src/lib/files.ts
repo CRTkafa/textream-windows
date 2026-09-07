@@ -73,13 +73,14 @@ async function withRememberedDirectory<T>(
  */
 export async function saveScript(script: string): Promise<boolean> {
   const ext = await extension();
+  const filters = await filter();
   const path = await withRememberedDirectory((directory) =>
     save({
       title: "Save script",
       defaultPath: directory
         ? `${directory}\\Untitled.${ext}`
         : `Untitled.${ext}`,
-      filters: await filter(),
+      filters,
     }),
   );
   if (!path) return false;
@@ -110,11 +111,12 @@ export async function openScript(
     if (!proceed) return null;
   }
 
+  const filters = await filter();
   const path = await withRememberedDirectory((defaultPath) =>
     open({
       title: "Open script",
       defaultPath,
-      filters: await filter(),
+      filters,
       multiple: false,
       directory: false,
     }),
