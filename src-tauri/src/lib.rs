@@ -24,6 +24,7 @@ use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
 use audio::{AudioEngine, DiagnosticsView};
 use backdrop::Backdrop;
@@ -140,8 +141,6 @@ fn stop_session(
     session: tauri::State<'_, SessionState>,
     audio: tauri::State<'_, AudioState>,
 ) -> ProgressView {
-    // Dropping the engine joins the capture and worker threads, so the
-    // microphone is released before the session reports stopped.
     *audio.0.lock().unwrap() = None;
 
     let progress = {
@@ -157,7 +156,6 @@ fn is_running(state: tauri::State<'_, SessionState>) -> bool {
     state.0.lock().unwrap().is_running()
 }
 
-/// Holds or resumes the prompter without releasing the microphone.
 #[tauri::command]
 fn set_paused(app: AppHandle, state: tauri::State<'_, SessionState>, paused: bool) -> ProgressView {
     let progress = {
@@ -168,7 +166,6 @@ fn set_paused(app: AppHandle, state: tauri::State<'_, SessionState>, paused: boo
     broadcast(&app, progress)
 }
 
-/// Mutes the microphone for the running session.
 #[tauri::command]
 fn set_microphone_muted(audio: tauri::State<'_, AudioState>, muted: bool) {
     if let Some(engine) = audio.0.lock().unwrap().as_ref() {
@@ -176,11 +173,6 @@ fn set_microphone_muted(audio: tauri::State<'_, AudioState>, muted: bool) {
     }
 }
 
-/// Advances the clock for the paced modes.
-///
-/// Word Tracking needs no ticking — the audio worker pushes progress events as
-/// speech arrives — but the UI calls this regardless so one animation loop
-/// covers every mode.
 #[tauri::command]
 fn tick(app: AppHandle, state: tauri::State<'_, SessionState>, delta_seconds: f64) -> ProgressView {
     let progress = state.0.lock().unwrap().tick(delta_seconds);
@@ -207,11 +199,6 @@ fn jump_to_offset(
     broadcast(&app, progress)
 }
 
-/// What the capture path is doing right now.
-///
-/// Words going missing because audio was dropped and words going missing
-/// because the model is weak look the same from the outside. This is what
-/// separates them.
 #[tauri::command]
 fn speech_diagnostics(audio: tauri::State<'_, AudioState>) -> DiagnosticsView {
     audio
@@ -223,7 +210,6 @@ fn speech_diagnostics(audio: tauri::State<'_, AudioState>) -> DiagnosticsView {
         .unwrap_or_default()
 }
 
-/// The global shortcuts and the keys they are bound to.
 #[tauri::command]
 fn shortcut_bindings() -> Vec<(String, String)> {
     shortcuts::described()
@@ -232,48 +218,26 @@ fn shortcut_bindings() -> Vec<(String, String)> {
         .collect()
 }
 
-/// The file extension `.textream` files use, without the leading dot.
-///
-/// Read by the frontend when it builds the save/open dialog's filter, so the
-/// extension is written in exactly one place rather than duplicated as a
-/// string literal on both sides of the IPC boundary.
 #[tauri::command]
 fn script_file_extension() -> &'static str {
     document::EXTENSION
 }
 
-/// Writes the script to a `.textream` file at `path`.
-///
-/// The dialog itself is chosen in the frontend, through `@tauri-apps/plugin-dialog`
-/// — this command only owns the file format, matching the split the macOS app
-/// makes between its `NSSavePanel` and `saveToURL`.
 #[tauri::command]
 fn save_script_file(path: String, text: String) -> Result<(), String> {
     document::save(std::path::Path::new(&path), &text)
 }
 
-/// Reads a `.textream` file at `path`, flattened to one script.
 #[tauri::command]
 fn open_script_file(path: String) -> Result<String, String> {
     document::load(std::path::Path::new(&path))
 }
 
-/// Which backdrop the compositor gave the main window.
-///
-/// The UI needs this because a frameless transparent window with no effect
-/// applied shows the desktop straight through — it has to paint an opaque
-/// background instead of looking broken.
 #[tauri::command]
 fn window_backdrop(state: tauri::State<'_, BackdropState>) -> Backdrop {
     *state.0.lock().unwrap()
 }
 
-/// Whether no settings file exists yet.
-///
-/// Read before `load_settings`, which never writes one — so this stays
-/// accurate for as long as the caller waits to check it. The editor uses it to
-/// decide whether to show the welcome banner, once, without an ever-growing
-/// pile of heuristics for guessing at "new user".
 #[tauri::command]
 fn is_first_run(app: AppHandle) -> Result<bool, String> {
     Ok(!settings::exists(&data_root(&app)?))
@@ -282,13 +246,10 @@ fn is_first_run(app: AppHandle) -> Result<bool, String> {
 #[tauri::command]
 fn load_settings(app: AppHandle) -> Result<Settings, String> {
     let settings = settings::load(&data_root(&app)?);
-    // Push appearance straight away: the overlay may already be listening, and
-    // it must never render one frame in last session's colours.
     let _ = app.emit_to(OVERLAY, EVENT_APPEARANCE, settings.appearance.view());
     Ok(settings)
 }
 
-/// Persists settings and pushes the visual half to the overlay.
 #[tauri::command]
 fn save_settings(app: AppHandle, settings: Settings) -> Result<Settings, String> {
     let settings = settings.sanitised();
@@ -302,10 +263,6 @@ fn speech_models(app: AppHandle) -> Result<Vec<ModelStatus>, String> {
     Ok(model::statuses(&data_root(&app)?))
 }
 
-/// Downloads a speech model, streaming progress to the UI.
-///
-/// Blocking IO on a worker thread rather than in the command itself, so the
-/// webview stays responsive for the minute or two this takes.
 #[tauri::command]
 async fn download_speech_model(app: AppHandle, id: String) -> Result<ModelStatus, String> {
     let chosen = model::find(&id).ok_or_else(|| format!("unknown speech model: {id}"))?;
@@ -334,9 +291,6 @@ fn remove_speech_model(app: AppHandle, id: String) -> Result<ModelStatus, String
 fn show_overlay(app: AppHandle, geometry: Geometry) -> Result<(), String> {
     let window = overlay_window(&app)?;
     overlay::apply(&window, geometry).map_err(|error| error.to_string())?;
-    // Plain `show` is safe here only because `WS_EX_NOACTIVATE` is already on
-    // the window: the style is what stops this call from yanking focus off
-    // whatever the presenter is actually driving.
     window.show().map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -354,7 +308,6 @@ fn set_overlay_geometry(app: AppHandle, geometry: Geometry) -> Result<(), String
     overlay::apply(&window, geometry).map_err(|error| error.to_string())
 }
 
-/// Lets clicks fall through the overlay to the app behind it.
 #[tauri::command]
 fn set_click_through(app: AppHandle, enabled: bool) -> Result<(), String> {
     let window = overlay_window(&app)?;
@@ -366,11 +319,6 @@ fn set_click_through(app: AppHandle, enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Hides the overlay from screen shares and recordings.
-///
-/// Returns whether the platform accepted it — `WDA_EXCLUDEFROMCAPTURE` needs
-/// Windows 10 2004 or newer, and the UI has to be able to say so rather than
-/// promise privacy it cannot deliver.
 #[tauri::command]
 fn set_hide_from_capture(app: AppHandle, enabled: bool) -> Result<bool, String> {
     let window = overlay_window(&app)?;
@@ -381,11 +329,6 @@ fn set_hide_from_capture(app: AppHandle, enabled: bool) -> Result<bool, String> 
     ))
 }
 
-/// Brings the main window to the front, restoring it if minimised.
-///
-/// Shared by the tray's left-click and its "Show Textream" menu item so the
-/// two gestures a user reaches for — click the icon, or right-click and pick
-/// the item — do exactly the same thing.
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -394,15 +337,34 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+fn request_quit(app: &AppHandle) {
+    let running = app.state::<SessionState>().0.lock().unwrap().is_running();
+    if !running {
+        app.exit(0);
+        return;
+    }
+
+    let handle = app.clone();
+    app.dialog()
+        .message("A teleprompter session is still running. Quit Textream anyway?")
+        .title("Quit while prompting?")
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Quit".into(),
+            "Keep prompting".into(),
+        ))
+        .show(move |quit| {
+            if quit {
+                handle.exit(0);
+            }
+        });
+}
+
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Show Textream", true, None::<&str>)?;
     let hide = MenuItem::with_id(app, "hide-overlay", "Hide overlay", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &hide, &quit])?;
 
-    // Configured in tauri.conf.json, so this is always `Some` today — but a
-    // missing icon should fail setup cleanly through the existing `?` chain
-    // rather than panic and take the whole app down with it.
     let icon = app
         .default_window_icon()
         .cloned()
@@ -412,14 +374,8 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .icon(icon)
         .tooltip("Textream")
         .menu(&menu)
-        // The menu still opens on right-click regardless of this setting; it
-        // only frees up left-click, which every other tray app on Windows
-        // treats as "show me the window" rather than "show me the menu".
         .show_menu_on_left_click(false)
         .on_tray_icon_event(|tray, event| {
-            // Windows itself treats WM_LBUTTONUP as the tray icon's activation
-            // signal, not the button-down that precedes it — matching that is
-            // what makes this feel like every other tray icon.
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
@@ -436,7 +392,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                     let _ = window.hide();
                 }
             }
-            "quit" => app.exit(0),
+            "quit" => request_quit(app),
             _ => {}
         })
         .build(app)?;
@@ -447,12 +403,6 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        // Must be the first plugin registered — it has to check for a running
-        // instance before anything else starts up. Without it, launching the
-        // app a second time while it sits in the tray (which closing the
-        // window now does on purpose) would open a second process fighting the
-        // first one for the same microphone and the same global shortcuts,
-        // rather than just bringing the existing window forward.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_main_window(app);
         }))
@@ -465,11 +415,6 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
 
-            // As early as the setup closure allows, and before anything that
-            // could plausibly panic. A release build has no console —
-            // `windows_subsystem = "windows"` sees to that — so without this,
-            // any panic on any thread, including the audio worker, vanishes
-            // with nothing left behind to debug from.
             let log_path = data_root(&handle).map(|root| root.join("textream.log"));
             if let Ok(path) = &log_path {
                 diagnostics::install_panic_hook(path.clone());
@@ -481,15 +426,6 @@ pub fn run() {
                 let applied = backdrop::apply(&window);
                 *app.state::<BackdropState>().0.lock().unwrap() = applied;
 
-                // `close()` — what the custom title bar's ✕ button calls —
-                // fires this event and then destroys the window unless something
-                // intervenes. A destroyed window is gone for the rest of the
-                // process: `get_webview_window("main")` returns `None` from then
-                // on, so neither the tray's "Show Textream" item nor a left-click
-                // could ever bring it back. Hiding it here instead is what makes
-                // the tray icon's "show" gesture mean anything at all — the ✕
-                // button tucks the editor away rather than ending the session
-                // the overlay may still be running.
                 let hideable = window.clone();
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -511,8 +447,6 @@ pub fn run() {
 
             if let Some(window) = app.get_webview_window(OVERLAY) {
                 if let Ok(hwnd) = window.hwnd() {
-                    // Applied once at startup: these style bits describe what
-                    // the window *is*, not a state that toggles.
                     window_effects::make_non_activating(hwnd.0 as isize);
                 }
                 let _ = window.hide();
