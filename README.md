@@ -204,7 +204,7 @@ else, not the only copy of anything.
 Requires:
 
 - Rust 1.80+ with the MSVC toolchain
-- Node 20+
+- Bun
 - WebView2 (preinstalled on Windows 11)
 - **LLVM** — `sherpa-rs-sys` generates its bindings with bindgen, which needs
   `libclang.dll`
@@ -218,19 +218,19 @@ its own, with no environment variable. If yours lives elsewhere, point
 `LIBCLANG_PATH` at the directory containing it.
 
 ```bash
-npm install
+bun install
 ```
 
 Run the app in development:
 
 ```bash
-npm run app
+bun run app
 ```
 
 Build the installer:
 
 ```bash
-npm run app:build
+bun run app:build
 ```
 
 Run the test suite:
