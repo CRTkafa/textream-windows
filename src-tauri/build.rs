@@ -9,7 +9,19 @@ const RUNTIME_LIBRARIES: &[&str] = &[
 ];
 
 fn main() {
-    stage_runtime_libraries();
+    let profile = std::env::var("PROFILE").unwrap_or_default();
+
+    if profile == "release" {
+        stage_runtime_libraries();
+    } else {
+        // `tauri-build` resolves and copies bundle resources even during
+        // `cargo test`. Those runtime DLLs only exist once the native sherpa
+        // dependency has produced them, and tests do not bundle an installer
+        // anyway. Remove the resource map for non-release builds so debug/test
+        // compilation does not depend on packaging artefacts.
+        std::env::set_var("TAURI_CONFIG", r#"{"bundle":{"resources":null}}"#);
+    }
+
     tauri_build::build()
 }
 
