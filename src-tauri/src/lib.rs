@@ -173,7 +173,7 @@ fn set_paused(app: AppHandle, state: tauri::State<'_, SessionState>, paused: boo
 #[tauri::command]
 fn set_microphone_muted(audio: tauri::State<'_, AudioState>, muted: bool) {
     if let Some(engine) = audio.0.lock().unwrap().as_ref() {
-        engine.set_muted(muted,);
+        engine.set_muted(muted);
     }
 }
 
@@ -476,7 +476,7 @@ pub fn run() {
         // instance before anything else starts up. Without it, launching the
         // app a second time while it sits in the tray (which closing the
         // window now does on purpose) would open a second process fighting the
-        // first for the same microphone and the same global shortcuts,
+        // first one for the same microphone and the same global shortcuts,
         // rather than just bringing the existing window forward.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_main_window(app);
