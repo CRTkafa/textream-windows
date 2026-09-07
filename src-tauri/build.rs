@@ -6,7 +6,6 @@ const RUNTIME_LIBRARIES: &[&str] = &[
     "onnxruntime_providers_shared.dll",
     "sherpa-onnx-c-api.dll",
     "sherpa-onnx-cxx-api.dll",
-    "cargs.dll",
 ];
 
 fn main() {
